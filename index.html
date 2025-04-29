@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Polygon Arbitrage Auto-Trader</title>
+  <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
+  <style>
+    body { background-color: #0b0c2a; color: #e0e0e0; font-family: Arial, sans-serif; padding: 20px; }
+    h1 { text-align: center; }
+    button, input { background-color: #00ff91; color: #0b0c2a; border: none; padding: 10px; margin: 5px; border-radius: 8px; font-weight: bold; cursor: pointer; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; background-color: #1e1f3a; }
+    th, td { border: 1px solid #333; padding: 8px; text-align: center; }
+    th { background-color: #2b2d5a; }
+    #profit { margin-top: 20px; font-size: 24px; text-align: center; color: #00ff91; }
+    .green { color: #00ff91; }
+    .red { color: #ff4c4c; }
+  </style>
+</head>
+
+<body>
+
+<h1>Polygon Arbitrage Auto-Trader</h1>
+<div style="text-align:center;">
+  <button onclick="connectWallet()">Connect Wallet</button><br>
+  Token Address: <input id="tokenAddressInput" type="text" value="0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"><br>
+  Trade Size (USDC): <input id="tradeAmountInput" type="number" value="1" min="0.00001" step="0.00001" onchange="updateTradeAmount()"><br>
+  DEX 1 Router: <input id="dex1Input" type="text" value="0xa5E0829f8f81F8e9e6F05D5A5BB71112d75c3C10"><br>
+  DEX 2 Router: <input id="dex2Input" type="text" value="0x1b02da8cb0d097eb8d57a175b88c7d8b47997506"><br>
+  Slippage: <input id="slippageInput" type="number" value="1" min="0" max="100" step="0.1"> %<br>
+  <button onclick="toggleMode()">Mode: Profit Only ✅</button><br>
+  <button onclick="startTrading()">Start Trading</button>
+  <button onclick="stopTrading()">Stop Trading</button>
+</div>
+
+<div id="walletInfo" style="text-align:center; margin-top:10px;">
+  Wallet: <span id="walletAddress">Not Connected</span><br>
+  USDC Balance: <span id="usdcBalance">-</span><br>
+  Token Balance: <span id="tokenBalance">-</span><br>
+</div>
+
+<div id="profit">Accumulated P/L: $0.0000</div>
+
+<table id="logTable">
+  <thead>
+    <tr>
+      <th>Time</th>
+      <th>DEX Route</th>
+      <th>USDC In</th>
+      <th>Token Out</th>
+      <th>USDC Returned</th>
+      <th>Net Profit</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<script>
+const usdcAddress = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+const erc20Abi = [
+  "function balanceOf(address) view returns (uint256)",
+  "function approve(address spender, uint256 amount) returns (bool)",
+  "function decimals() view returns (uint8)"
+];
+const routerAbi = [
+  "function getAmountsOut(uint amountIn, address[] memory path) view returns (uint[] memory amounts)",
+  "function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) returns (uint[] memory amounts)"
+];
+
+let provider, signer, walletAddress;
+let currentTradeAmount = ethers.utils.parseUnits("1", 6); // $1 USDC
+let tokenAddress = document.getElementById("tokenAddressInput").value;
+let profitOnly = true;
+let accumulatedProfit = 0;
+let tradingInterval;
+
+async function connectWallet() {
+  if (!window.ethereum) return alert("Install MetaMask!");
+  provider = new ethers.providers.Web3Provider(window.ethereum);
+  await provider.send("eth_requestAccounts", []);
+  signer = provider.getSigner();
+  walletAddress = await signer.getAddress();
+  document.getElementById("walletAddress").innerText = walletAddress;
+  await getBalances();
+}
+
+async function getBalances() {
+  const usdc = new ethers.Contract(usdcAddress, erc20Abi, provider);
+  const token = new ethers.Contract(tokenAddress, erc20Abi, provider);
+  const usdcBal = await usdc.balanceOf(walletAddress);
+  const tokenBal = await token.balanceOf(walletAddress);
+  const tokenDec = await token.decimals();
+
+  document.getElementById("usdcBalance").innerText = (usdcBal / 1e6).toFixed(4);
+  document.getElementById("tokenBalance").innerText = (tokenBal / (10 ** tokenDec)).toFixed(4);
+}
+
+function updateTradeAmount() {
+  const val = parseFloat(document.getElementById("tradeAmountInput").value);
+  if (val < 0.00001) return;
+  currentTradeAmount = ethers.utils.parseUnits(val.toString(), 6);
+}
+
+function toggleMode() {
+  profitOnly = !profitOnly;
+  const button = document.querySelector('button[onclick="toggleMode()"]');
+  button.innerText = profitOnly ? "Mode: Profit Only ✅" : "Mode: Always Trade ⚡";
+}
+
+function updateProfit() {
+  document.getElementById("profit").innerText = `Accumulated P/L: $${accumulatedProfit.toFixed(6)}`;
+}
+
+function logTrade(routeIn, routeOut, usdcIn, tokenOut, usdcOut, netProfit, status) {
+  const row = document.getElementById("logTable").querySelector("tbody").insertRow();
+  row.innerHTML = `
+    <td>${new Date().toLocaleTimeString()}</td>
+    <td>${routeIn} ➔ ${routeOut}</td>
+    <td>$${usdcIn}</td>
+    <td>${tokenOut}</td>
+    <td>$${usdcOut}</td>
+    <td class="${netProfit >= 0 ? 'green' : 'red'}">$${netProfit.toFixed(6)}</td>
+    <td>${status}</td>
+  `;
+}
+
+async function simulateAndTrade() {
+  try {
+    tokenAddress = document.getElementById("tokenAddressInput").value;
+    const router1Addr = document.getElementById("dex1Input").value;
+    const router2Addr = document.getElementById("dex2Input").value;
+    const router1 = new ethers.Contract(router1Addr, routerAbi, signer);
+    const router2 = new ethers.Contract(router2Addr, routerAbi, signer);
+
+    const outTokens = await router1.getAmountsOut(currentTradeAmount, [usdcAddress, tokenAddress]);
+    const outUSDC = await router2.getAmountsOut(outTokens[1], [tokenAddress, usdcAddress]);
+
+    const tokenOut = outTokens[1];
+    const usdcBack = outUSDC[1];
+    const netProfit = parseFloat(ethers.utils.formatUnits(usdcBack.sub(currentTradeAmount), 6));
+
+    if (!profitOnly || netProfit > 0) {
+      const usdcContract = new ethers.Contract(usdcAddress, erc20Abi, signer);
+      await usdcContract.approve(router1Addr, currentTradeAmount);
+      await router1.swapExactTokensForTokens(
+        currentTradeAmount,
+        0,
+        [usdcAddress, tokenAddress],
+        walletAddress,
+        Math.floor(Date.now() / 1000) + 60
+      );
+
+      const tokenContract = new ethers.Contract(tokenAddress, erc20Abi, signer);
+      const tokenBalance = await tokenContract.balanceOf(walletAddress);
+      await tokenContract.approve(router2Addr, tokenBalance);
+      await router2.swapExactTokensForTokens(
+        tokenBalance,
+        0,
+        [tokenAddress, usdcAddress],
+        walletAddress,
+        Math.floor(Date.now() / 1000) + 60
+      );
+
+      accumulatedProfit += netProfit;
+      updateProfit();
+      logTrade(router1Addr, router2Addr, ethers.utils.formatUnits(currentTradeAmount, 6), tokenOut.toString(), ethers.utils.formatUnits(usdcBack, 6), netProfit, "✅ Executed");
+      await getBalances();
+    } else {
+      logTrade(router1Addr, router2Addr, ethers.utils.formatUnits(currentTradeAmount, 6), tokenOut.toString(), ethers.utils.formatUnits(usdcBack, 6), netProfit, "❌ Skipped");
+    }
+  } catch (e) {
+    console.error("Trade Error:", e);
+  }
+}
+
+function startTrading() {
+  if (tradingInterval) clearInterval(tradingInterval);
+  simulateAndTrade();
+  tradingInterval = setInterval(simulateAndTrade, 8000);
+}
+
+function stopTrading() {
+  if (tradingInterval) clearInterval(tradingInterval);
+  tradingInterval = null;
+}
+</script>
+</body>
+</html>
